@@ -1,0 +1,147 @@
+---
+- name: Provision and Configure Web Server
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    region: "us-east-1"  # Change to your desired region
+    instance_type: "t2.micro"  # Change to your desired instance type
+    key_name: "your_key_pair_name"  # Change to your existing EC2 key pair name
+    ami_id: "your_ami_id"  # Change to your desired AMI ID for the region (e.g., Amazon Linux 2)
+
+  tasks:
+    - name: Provision EC2 instance
+      ec2:
+        region: "{{ region }}"
+        key_name: "{{ key_name }}"
+        instance_type: "{{ instance_type }}"
+        image_id: "{{ ami_id }}"
+        wait: true
+        count: 1
+        instance_tags:
+          Name: WebServerInstance
+      register: ec2_instance
+
+    - name: Wait for SSH to become available
+      wait_for:
+        host: "{{ item.public_ip }}"
+        port: 22
+        delay: 30
+        timeout: 600
+      with_items: "{{ ec2_instance.instances }}"
+
+    - name: Add EC2 instance to host group
+      add_host:
+        hostname: "{{ item.public_ip }}"
+        groups: web_server
+      with_items: "{{ ec2_instance.instances }}"
+
+    - name: Update apt cache (for Ubuntu) or yum cache (for Amazon Linux)
+      become: true
+      apt:  # Change to "yum" if using Amazon Linux
+        update_cache: yes
+      when: ansible_os_family == "Debian"
+
+    - name: Install Apache web server (for Amazon Linux) or Nginx (for Ubuntu)
+      become: true
+      yum:  # Change to "apt" if using Ubuntu
+        name: "{{ item }}"
+        state: present
+      with_items:
+        - httpd  # Change to "nginx" if using Ubuntu
+
+    - name: Ensure Apache (httpd) or Nginx service is running and enabled
+      become: true
+      service:
+        name: "{{ item }}"
+        state: started
+        enabled: true
+      with_items:
+        - httpd  # Change to "nginx" if using Ubuntu
+
+    - name: Deploy Hello World HTML page
+      become: true
+      copy:
+        content: |
+          <html>
+          <head>
+          <title>Hello World</title>
+          </head>
+          <body>
+          <h1>Hello World!</h1>
+          </body>
+          </html>
+        dest: /var/www/html/index.html  # Change path if using Nginx
+
+    - name: Install OpenSSL for self-signed SSL certificate
+      become: true
+      yum:  # Change to "apt" if using Ubuntu
+        name: openssl
+        state: present
+
+    - name: Generate self-signed SSL certificate
+      become: true
+      command: |
+        openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+        -keyout /etc/pki/tls/private/server.key \
+        -out /etc/pki/tls/certs/server.crt \
+        -subj "/C=US/ST=State/L=City/O=Organization/CN=example.com"  # Replace with your domain name
+
+    - name: Configure Apache for SSL
+      become: true
+      template:
+        src: apache_ssl.conf.j2
+        dest: /etc/httpd/conf.d/ssl.conf  # Change path if using Nginx
+
+    - name: Redirect HTTP requests to HTTPS
+      become: true
+      lineinfile:
+        dest: /etc/httpd/conf/httpd.conf  # Change path if using Nginx
+        regexp: "^#?ServerName.*"
+        line: "ServerName localhost:80"
+        state: present
+
+    - name: Restart Apache (httpd) or Nginx
+      become: true
+      service:
+        name: "{{ item }}"
+        state: restarted
+      with_items:
+        - httpd  # Change to "nginx" if using Ubuntu
+
+- name: Apply Security Group Configuration
+  hosts: web_server
+  gather_facts: false
+
+  vars:
+    web_server_group_name: "WebServerSecurityGroup"
+
+  tasks:
+    - name: Create security group
+      ec2_group:
+        name: "{{ web_server_group_name }}"
+        description: "Security group for the web server"
+        region: "{{ region }}"
+        rules:
+          - proto: tcp
+            ports:
+              - 80
+              - 443
+            cidr_ip: 0.0.0.0/0
+      register: security_group
+
+    - name: Add inbound rules to the security group
+      ec2_group:
+        name: "{{ web_server_group_name }}"
+        description: "Security group for the web server"
+        region: "{{ region }}"
+        rules_egress:
+          - proto: all
+            cidr_ip: 0.0.0.0/0
+        rules:
+          - proto: tcp
+            ports:
+              - 80
+              - 443
+            cidr_ip: 0.0.0.0/0
+      when: security_group.rules_egress != security_group.group_rules
